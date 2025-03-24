@@ -12,7 +12,7 @@ import numpy as np
 import requests
 import tiktoken
 from botocore.config import Config
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
@@ -37,32 +37,70 @@ from api.schema import (
     Usage,
     UserMessage,
 )
-from api.setting import AWS_REGION, DEBUG, DEFAULT_MODEL, ENABLE_CROSS_REGION_INFERENCE
+from api.setting import DEBUG, DEFAULT_MODEL, ENABLE_CROSS_REGION_INFERENCE
 
 logger = logging.getLogger(__name__)
 
 config = Config(connect_timeout=60, read_timeout=120, retries={"max_attempts": 1})
 
-bedrock_runtime = boto3.client(
-    service_name="bedrock-runtime",
-    region_name=AWS_REGION,
-    config=config,
-)
-bedrock_client = boto3.client(
-    service_name="bedrock",
-    region_name=AWS_REGION,
-    config=config,
-)
+def get_bedrock_clients(request: Request):
+    """根据请求头动态创建bedrock客户端"""
+    auth_header = request.headers.get("Authorization")
+    # 有可能是bearer token
+    if auth_header and auth_header.startswith("Bearer "):
+        auth_header = auth_header.split(" ")[1]
+    region = request.headers.get("aws-region")
+    
+    if not auth_header or not region:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required headers: Authorization and aws-region"
+        )
+    
+    try:
+        access_key, secret_key = auth_header.split("##")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Authorization header format. Expected format: accesskey##secret"
+        )
+    
+    session = boto3.Session(
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region
+    )
+    
+    bedrock_runtime = session.client(
+        service_name="bedrock-runtime",
+        config=config
+    )
+    
+    bedrock_client = session.client(
+        service_name="bedrock",
+        config=config
+    )
+    
+    return bedrock_runtime, bedrock_client
 
 
-def get_inference_region_prefix():
-    if AWS_REGION.startswith("ap-"):
+def get_inference_region_prefix(bedrock_client):
+    """根据bedrock客户端获取inference前缀
+    
+    Args:
+        bedrock_client: bedrock客户端对象
+        
+    Returns:
+        str: inference前缀，例如 'apac' 或 'us'
+    """
+    region = bedrock_client.meta.region_name
+    if region.startswith("ap-"):
         return "apac"
-    return AWS_REGION[:2]
+    return region[:2]
 
 
 # https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html
-cr_inference_prefix = get_inference_region_prefix()
+# 移除全局的cr_inference_prefix，改为在list_bedrock_models中动态计算
 
 SUPPORTED_BEDROCK_EMBEDDING_MODELS = {
     "cohere.embed-multilingual-v3": "Cohere Embed Multilingual",
@@ -75,7 +113,7 @@ SUPPORTED_BEDROCK_EMBEDDING_MODELS = {
 ENCODER = tiktoken.get_encoding("cl100k_base")
 
 
-def list_bedrock_models() -> dict:
+def list_bedrock_models(bedrock_client):
     """Automatically getting a list of supported models.
 
     Returns a model list combines:
@@ -109,6 +147,7 @@ def list_bedrock_models() -> dict:
                 model_list[model_id] = {"modalities": input_modalities}
 
             # Add cross-region inference model list.
+            cr_inference_prefix = get_inference_region_prefix(bedrock_client)
             profile_id = cr_inference_prefix + "." + model_id
             if profile_id in profile_list:
                 model_list[profile_id] = {"modalities": input_modalities}
@@ -123,29 +162,31 @@ def list_bedrock_models() -> dict:
     return model_list
 
 
-# Initialize the model list.
-bedrock_model_list = list_bedrock_models()
 
 
 class BedrockModel(BaseChatModel):
+    def __init__(self, bedrock_runtime, bedrock_client):
+        self.bedrock_runtime = bedrock_runtime
+        self.bedrock_client = bedrock_client
+
     def list_models(self) -> list[str]:
         """Always refresh the latest model list"""
-        global bedrock_model_list
-        bedrock_model_list = list_bedrock_models()
+        bedrock_model_list = list_bedrock_models(self.bedrock_client)
         return list(bedrock_model_list.keys())
 
     def validate(self, chat_request: ChatRequest):
         """Perform basic validation on requests"""
-        error = ""
-        # check if model is supported
-        if chat_request.model not in bedrock_model_list.keys():
-            error = f"Unsupported model {chat_request.model}, please use models API to get a list of supported models"
+        return 
+        # error = ""
+        # # check if model is supported
+        # if chat_request.model not in self.list_models():
+        #     error = f"Unsupported model {chat_request.model}, please use models API to get a list of supported models"
 
-        if error:
-            raise HTTPException(
-                status_code=400,
-                detail=error,
-            )
+        # if error:
+        #     raise HTTPException(
+        #         status_code=400,
+        #         detail=error,
+        #     )
 
     async def _invoke_bedrock(self, chat_request: ChatRequest, stream=False):
         """Common logic for invoke bedrock models"""
@@ -160,14 +201,14 @@ class BedrockModel(BaseChatModel):
         try:
             if stream:
                 # Run the blocking boto3 call in a thread pool
-                response = await run_in_threadpool(bedrock_runtime.converse_stream, **args)
+                response = await run_in_threadpool(self.bedrock_runtime.converse_stream, **args)
             else:
                 # Run the blocking boto3 call in a thread pool
-                response = await run_in_threadpool(bedrock_runtime.converse, **args)
-        except bedrock_runtime.exceptions.ValidationException as e:
+                response = await run_in_threadpool(self.bedrock_runtime.converse, **args)
+        except self.bedrock_runtime.exceptions.ValidationException as e:
             logger.error("Validation Error: " + str(e))
             raise HTTPException(status_code=400, detail=str(e))
-        except bedrock_runtime.exceptions.ThrottlingException as e:
+        except self.bedrock_runtime.exceptions.ThrottlingException as e:
             logger.error("Throttling Error: " + str(e))
             raise HTTPException(status_code=429, detail=str(e))
         except Exception as e:
@@ -717,22 +758,25 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
     accept = "application/json"
     content_type = "application/json"
 
+    def __init__(self, bedrock_runtime):
+        self.bedrock_runtime = bedrock_runtime
+
     def _invoke_model(self, args: dict, model_id: str):
         body = json.dumps(args)
         if DEBUG:
             logger.info("Invoke Bedrock Model: " + model_id)
             logger.info("Bedrock request body: " + body)
         try:
-            return bedrock_runtime.invoke_model(
+            return self.bedrock_runtime.invoke_model(
                 body=body,
                 modelId=model_id,
                 accept=self.accept,
                 contentType=self.content_type,
             )
-        except bedrock_runtime.exceptions.ValidationException as e:
+        except self.bedrock_runtime.exceptions.ValidationException as e:
             logger.error("Validation Error: " + str(e))
             raise HTTPException(status_code=400, detail=str(e))
-        except bedrock_runtime.exceptions.ThrottlingException as e:
+        except self.bedrock_runtime.exceptions.ThrottlingException as e:
             logger.error("Throttling Error: " + str(e))
             raise HTTPException(status_code=429, detail=str(e))
         except Exception as e:
@@ -845,13 +889,13 @@ class TitanEmbeddingsModel(BedrockEmbeddingsModel):
         )
 
 
-def get_embeddings_model(model_id: str) -> BedrockEmbeddingsModel:
+def get_embeddings_model(model_id: str, bedrock_runtime) -> BedrockEmbeddingsModel:
     model_name = SUPPORTED_BEDROCK_EMBEDDING_MODELS.get(model_id, "")
     if DEBUG:
         logger.info("model name is " + model_name)
     match model_name:
         case "Cohere Embed Multilingual" | "Cohere Embed English":
-            return CohereEmbeddingsModel()
+            return CohereEmbeddingsModel(bedrock_runtime)
         case _:
             logger.error("Unsupported model id " + model_id)
             raise HTTPException(
